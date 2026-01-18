@@ -1,48 +1,49 @@
 """
-AI_Resume_Builder
-AI-Based Resume Enhancement & Portfolio Builder
-Single-file Streamlit App (Classical NLP, No LLMs)
-Deployable on Streamlit Cloud
+AI Resume & Portfolio Builder
+Generate tailored, ATS-aware resumes, cover letters, and portfolio ZIPs from student profile JSON or PDF upload.
+Built with Streamlit, classical NLP, and template-based generation.
 """
 
 import streamlit as st
 import PyPDF2
 import re
+import json
+import zipfile
+from datetime import datetime
 from fpdf import FPDF
 from sklearn.feature_extraction.text import TfidfVectorizer
 
+try:
+    from docx import Document
+    from docx.shared import Pt
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    HAS_DOCX = True
+except ImportError:
+    HAS_DOCX = False
+
+try:
+    from bs4 import BeautifulSoup
+except ImportError:
+    BeautifulSoup = None
+
+try:
+    import weasyprint
+    HAS_WEASYPRINT = True
+except ImportError:
+    HAS_WEASYPRINT = False
+
 
 # ======================================================
-# Resume Parser (merged from resume_parser.py)
+# PDF and Document Utilities
 # ======================================================
-def fix_text_spacing(text: str) -> str:
-    """Fix spacing issues in PDF-extracted text by adding spaces between words"""
-    if not text:
-        return text
-    
-    # Add space before capital letters that follow lowercase letters or numbers
-    text = re.sub(r'([a-z0-9])([A-Z])', r'\1 \2', text)
-    
-    # Add space after capital letters before lowercase (for acronyms like "AI" followed by word)
-    text = re.sub(r'([A-Z]{2,})([a-z])', r'\1 \2', text)
-    
-    # Add space around special characters that should have spaces
-    text = re.sub(r'([a-zA-Z0-9])([&|/])([a-zA-Z0-9])', r'\1 \2 \3', text)
-    
-    # Add space before numbers that follow letters
-    text = re.sub(r'([a-zA-Z])(\d)', r'\1 \2', text)
-    
-    # Add space after numbers that precede letters
-    text = re.sub(r'(\d)([a-zA-Z])', r'\1 \2', text)
-    
-    # Normalize multiple spaces to single space
+def sanitize_html_text(html_content: str) -> str:
+    """Extract and sanitize text from HTML"""
+    text = re.sub(r'<[^>]+>', '', html_content)
+    text = text.replace('&nbsp;', ' ').replace('&amp;', '&').replace('&lt;', '<')
+    text = text.replace('&gt;', '>').replace('&quot;', '"')
     text = re.sub(r'\s+', ' ', text)
-    
-    # Fix common patterns
-    text = text.replace('&', ' & ')
-    text = re.sub(r'\s+', ' ', text)  # Normalize again after replacements
-    
     return text.strip()
+
 
 
 def extract_text_from_pdf(uploaded_file) -> str:
@@ -52,15 +53,92 @@ def extract_text_from_pdf(uploaded_file) -> str:
         page_text = page.extract_text()
         if page_text:
             text += page_text + "\n"
-    # Fix spacing issues in extracted text
-    text = fix_text_spacing(text)
     return text.strip()
 
 
 # ======================================================
-# AI / NLP Logic (merged from resume_ai.py)
+# ATS Keyword Extraction (from ats.py)
 # ======================================================
-def enhance_resume(resume_text: str) -> str:
+def extract_keywords(job_description: str) -> list:
+    """
+    Extract ATS keywords from job description using TF-IDF
+    
+    Args:
+        job_description: Job description text
+        
+    Returns:
+        List of extracted keywords
+    """
+    if not job_description:
+        return []
+    
+    # Common ATS keywords to look for
+    common_keywords = [
+        'python', 'java', 'javascript', 'sql', 'machine learning', 'data science',
+        'cloud', 'aws', 'azure', 'docker', 'kubernetes', 'agile', 'scrum',
+        'project management', 'leadership', 'communication', 'analytics',
+        'deep learning', 'neural networks', 'nlp', 'computer vision',
+        'tensorflow', 'pytorch', 'pandas', 'numpy', 'scikit-learn',
+        'git', 'github', 'ci/cd', 'rest api', 'microservices'
+    ]
+    
+    # Use TF-IDF to extract important terms
+    vectorizer = TfidfVectorizer(
+        stop_words='english', 
+        max_features=30, 
+        ngram_range=(1, 2),
+        lowercase=True
+    )
+    
+    try:
+        tfidf_matrix = vectorizer.fit_transform([job_description.lower()])
+        feature_names = vectorizer.get_feature_names_out()
+        scores = tfidf_matrix.toarray()[0]
+        
+        # Get top keywords by score
+        keyword_scores = list(zip(feature_names, scores))
+        keyword_scores.sort(key=lambda x: x[1], reverse=True)
+        extracted = [kw for kw, score in keyword_scores[:20] if score > 0]
+        
+        # Also check for common keywords in job description
+        jd_lower = job_description.lower()
+        found_common = [kw for kw in common_keywords if kw in jd_lower]
+        
+        # Combine and deduplicate
+        all_keywords = list(set(extracted + found_common))
+        return all_keywords[:25]
+    except Exception as e:
+        # Fallback: return common keywords if found
+        jd_lower = job_description.lower()
+        return [kw for kw in common_keywords if kw in jd_lower][:15]
+
+
+
+
+
+def merge_keywords(resume_text: str, keywords: list) -> str:
+    """Merge ATS keywords naturally into resume text"""
+    if not keywords:
+        return resume_text
+    
+    resume_lower = resume_text.lower()
+    missing_keywords = [kw for kw in keywords if kw not in resume_lower]
+    
+    if missing_keywords:
+        if 'skills' in resume_lower or 'technical' in resume_lower:
+            skills_section = f"\n\nAdditional Skills: {', '.join(missing_keywords[:10])}"
+        else:
+            skills_section = f"\n\nRelevant Skills: {', '.join(missing_keywords[:10])}"
+        return resume_text + skills_section
+    
+    return resume_text
+
+
+# ======================================================
+# AI / NLP Logic - Enhanced Summaries & STAR Format
+# ======================================================
+def enhance_resume(resume_text: str, job_description: str = "") -> str:
+    """Generate enhanced professional summary"""
     resume_text = " ".join(resume_text.split())
 
     if not resume_text:
@@ -78,9 +156,16 @@ def enhance_resume(resume_text: str) -> str:
     if not top_keywords:
         top_keywords = ["problem solving", "communication", "teamwork"]
 
+    # Incorporate ATS keywords if job description provided
+    if job_description:
+        ats_keywords = extract_keywords(job_description)
+        relevant_ats = [kw for kw in ats_keywords[:5] if kw not in ' '.join(top_keywords).lower()]
+        if relevant_ats:
+            top_keywords = top_keywords[:5] + relevant_ats[:3]
+
     summary = (
         "Results-driven student with practical exposure to "
-        + ", ".join(top_keywords)
+        + ", ".join(top_keywords[:8])
         + ". Possesses strong analytical thinking, adaptability, and a continuous learning mindset. "
           "Actively seeking opportunities to contribute to impactful projects and grow professionally."
     )
@@ -88,151 +173,528 @@ def enhance_resume(resume_text: str) -> str:
     return summary
 
 
+def generate_star_bullets(experience_text: str, job_keywords: list = None) -> list:
+    """Generate STAR-format bullet points from experience"""
+    if not experience_text:
+        return []
+    
+    # Extract action verbs and achievements
+    action_verbs = ['developed', 'implemented', 'designed', 'created', 'managed', 'led', 
+                   'improved', 'optimized', 'achieved', 'increased', 'reduced', 'delivered']
+    
+    sentences = re.split(r'[.!?]\s+', experience_text)
+    bullets = []
+    
+    for sentence in sentences[:5]:  # Limit to 5 bullets
+        sentence = sentence.strip()
+        if len(sentence) > 20 and any(verb in sentence.lower() for verb in action_verbs):
+            # Format as STAR bullet
+            bullet = f"• {sentence.capitalize()}"
+            if not bullet.endswith('.'):
+                bullet += '.'
+            bullets.append(bullet)
+    
+    # If no good bullets found, create generic ones
+    if not bullets:
+        bullets = [
+            "• Applied technical skills to solve complex problems and deliver measurable results.",
+            "• Collaborated with team members to achieve project objectives and meet deadlines.",
+            "• Demonstrated strong problem-solving abilities and attention to detail."
+        ]
+    
+    return bullets[:5]
+
+
+def generate_cover_letter(name: str, job_description: str, resume_text: str) -> str:
+    """Generate a cover letter based on resume and job description"""
+    if not job_description:
+        return (
+            f"Dear Hiring Manager,\n\n"
+            f"I am writing to express my interest in the position. "
+            f"With my background in {extract_keywords(resume_text)[:3] if resume_text else 'relevant field'}, "
+            f"I am confident I would be a valuable addition to your team.\n\n"
+            f"Sincerely,\n{name if name else 'Your Name'}"
+        )
+    
+    # Extract key requirements from job description
+    keywords = extract_keywords(job_description)
+    skills_mentioned = ', '.join(keywords[:5]) if keywords else 'relevant skills'
+    
+    cover_letter = f"""Dear Hiring Manager,
+
+I am writing to express my strong interest in the position. With my background in {skills_mentioned}, 
+I am excited about the opportunity to contribute to your team.
+
+My experience aligns well with the requirements you've outlined. I have a proven track record of 
+delivering results and working collaboratively in dynamic environments.
+
+I am eager to discuss how my skills and experience can benefit your organization. Thank you for 
+considering my application.
+
+Sincerely,
+{name if name else 'Your Name'}"""
+    
+    return cover_letter
+
+
 # ======================================================
-# PDF Generator (merged from pdf_generator.py)
+# PDF Generator with Templates
 # ======================================================
 def sanitize_text_for_pdf(text: str) -> str:
     """Remove or replace Unicode characters that can't be encoded in latin-1"""
     if not text:
         return ""
-    # Replace common Unicode characters with ASCII equivalents
     replacements = {
-        '\uf10b': '',  # Remove problematic characters
-        '\u2013': '-',  # En dash
-        '\u2014': '--',  # Em dash
-        '\u2018': "'",  # Left single quotation mark
-        '\u2019': "'",  # Right single quotation mark
-        '\u201c': '"',  # Left double quotation mark
-        '\u201d': '"',  # Right double quotation mark
-        '\u2026': '...',  # Ellipsis
+        '\uf10b': '',
+        '\u2013': '-',
+        '\u2014': '--',
+        '\u2018': "'",
+        '\u2019': "'",
+        '\u201c': '"',
+        '\u201d': '"',
+        '\u2026': '...',
     }
     result = text
     for unicode_char, replacement in replacements.items():
         result = result.replace(unicode_char, replacement)
-    # Remove any remaining non-ASCII characters that can't be encoded
     try:
         result.encode('latin-1')
         return result
     except UnicodeEncodeError:
-        # If still has issues, remove all non-ASCII characters
         return result.encode('ascii', 'ignore').decode('ascii')
 
 
-def create_enhanced_pdf(name, email, summary, resume_text) -> str:
+def create_pdf_resume(name, email, summary, resume_text, template="modern", star_bullets=None) -> str:
+    """Create PDF resume with different templates"""
     pdf = FPDF()
     pdf.add_page()
     pdf.set_auto_page_break(auto=True, margin=15)
 
-    # Sanitize all text inputs for PDF encoding
     safe_name = sanitize_text_for_pdf(name) if name else "Candidate Name"
     safe_email = sanitize_text_for_pdf(email) if email else "email@example.com"
     safe_summary = sanitize_text_for_pdf(summary) if summary else ""
-    
     safe_text = sanitize_text_for_pdf(resume_text.strip() if resume_text else "")
-    if len(safe_text) > 6000:
-        safe_text = safe_text[:6000] + "\n\n[Content truncated for readability]"
 
-    # Header
-    pdf.set_font("Arial", "B", 16)
-    pdf.cell(0, 10, safe_name, ln=True)
-
-    pdf.set_font("Arial", size=12)
-    pdf.cell(0, 8, safe_email, ln=True)
-
-    pdf.ln(6)
-
-    # Summary Section
-    pdf.set_font("Arial", "B", 14)
-    pdf.cell(0, 10, "Enhanced Professional Summary", ln=True)
-
-    pdf.set_font("Arial", size=12)
-    pdf.multi_cell(0, 7, safe_summary)
+    if template == "modern":
+        pdf.set_font("Arial", "B", 18)
+        pdf.cell(0, 12, safe_name, ln=True)
+        pdf.set_font("Arial", size=11)
+        pdf.cell(0, 8, safe_email, ln=True)
+        pdf.ln(8)
+        pdf.set_font("Arial", "B", 14)
+        pdf.cell(0, 10, "Professional Summary", ln=True)
+        pdf.set_font("Arial", size=11)
+        pdf.multi_cell(0, 6, safe_summary)
+        if star_bullets:
+            pdf.ln(4)
+            pdf.set_font("Arial", "B", 14)
+            pdf.cell(0, 10, "Key Achievements", ln=True)
+            pdf.set_font("Arial", size=10)
+            for bullet in star_bullets[:5]:
+                pdf.multi_cell(0, 5, sanitize_text_for_pdf(bullet))
+    else:
+        pdf.set_font("Times", "B", 16)
+        pdf.cell(0, 10, safe_name, ln=True)
+        pdf.set_font("Times", size=11)
+        pdf.cell(0, 8, safe_email, ln=True)
+        pdf.ln(6)
+        pdf.set_font("Times", "B", 12)
+        pdf.cell(0, 8, "SUMMARY", ln=True)
+        pdf.set_font("Times", size=10)
+        pdf.multi_cell(0, 6, safe_summary)
 
     pdf.ln(4)
-
-    # Resume Content Section
     pdf.set_font("Arial", "B", 14)
-    pdf.cell(0, 10, "Extracted & Refined Resume Content", ln=True)
+    pdf.cell(0, 10, "Experience & Skills", ln=True)
+    pdf.set_font("Arial", size=10)
+    if len(safe_text) > 5000:
+        safe_text = safe_text[:5000]
+    pdf.multi_cell(0, 5, safe_text)
 
-    pdf.set_font("Arial", size=11)
-    pdf.multi_cell(0, 6, safe_text if safe_text else "No resume text available.")
-
-    output_file = "Enhanced_AI_Resume.pdf"
+    output_file = f"Resume_{template.capitalize()}.pdf"
     pdf.output(output_file)
     return output_file
 
 
 # ======================================================
-# Streamlit UI (merged & cleaned app.py)
+# DOCX Generator
+# ======================================================
+def create_docx_resume(name, email, summary, resume_text, template="modern", star_bullets=None) -> str:
+    """Create DOCX resume"""
+    if not HAS_DOCX:
+        return None
+    
+    doc = Document()
+    
+    safe_name = name if name else "Candidate Name"
+    safe_email = email if email else "email@example.com"
+    safe_summary = summary if summary else ""
+    safe_text = resume_text.strip() if resume_text else ""
+    
+    heading = doc.add_heading(safe_name, 0)
+    heading.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    
+    email_para = doc.add_paragraph(safe_email)
+    email_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    doc.add_paragraph()
+    
+    doc.add_heading('Professional Summary', level=1)
+    doc.add_paragraph(safe_summary)
+    
+    if star_bullets:
+        doc.add_heading('Key Achievements', level=1)
+        for bullet in star_bullets[:5]:
+            doc.add_paragraph(bullet, style='List Bullet')
+    
+    doc.add_heading('Experience & Skills', level=1)
+    if len(safe_text) > 5000:
+        safe_text = safe_text[:5000]
+    doc.add_paragraph(safe_text)
+    
+    output_file = f"Resume_{template.capitalize()}.docx"
+    doc.save(output_file)
+    return output_file
+
+
+# ======================================================
+# Portfolio ZIP Generator
+# ======================================================
+def create_portfolio_zip(name, email, summary, resume_text, cover_letter, pdf_path=None, docx_path=None) -> str:
+    """Create a ZIP file containing portfolio documents"""
+    zip_filename = f"Portfolio_{name.replace(' ', '_') if name else 'Candidate'}_{datetime.now().strftime('%Y%m%d')}.zip"
+    
+    with zipfile.ZipFile(zip_filename, 'w', zipfile.ZIP_DEFLATED) as zipf:
+        if pdf_path:
+            zipf.write(pdf_path, f"Resume_{name.replace(' ', '_') if name else 'Resume'}.pdf")
+        if docx_path:
+            zipf.write(docx_path, f"Resume_{name.replace(' ', '_') if name else 'Resume'}.docx")
+        if cover_letter:
+            zipf.writestr("Cover_Letter.txt", cover_letter)
+        if summary:
+            zipf.writestr("Professional_Summary.txt", summary)
+        if resume_text:
+            zipf.writestr("Resume_Content.txt", resume_text)
+    
+    return zip_filename
+
+
+# ======================================================
+# JSON Profile Management
+# ======================================================
+def save_profile_to_json(name, email, resume_text, job_description="", summary="", cover_letter="") -> str:
+    """Save profile data to JSON file"""
+    profile = {
+        "name": name,
+        "email": email,
+        "resume_text": resume_text,
+        "job_description": job_description,
+        "summary": summary,
+        "cover_letter": cover_letter,
+        "created_at": datetime.now().isoformat()
+    }
+    
+    filename = f"profile_{name.replace(' ', '_') if name else 'candidate'}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+    with open(filename, 'w', encoding='utf-8') as f:
+        json.dump(profile, f, indent=2, ensure_ascii=False)
+    
+    return filename
+
+
+# ======================================================
+# Streamlit UI
 # ======================================================
 st.set_page_config(
-    page_title="AI Resume Enhancement & Builder",
+    page_title="AI Resume & Portfolio Builder",
     page_icon="📝",
-    layout="centered"
+    layout="wide"
 )
 
-st.title("📝 AI Resume Enhancement & Portfolio Builder")
-st.caption("Classical NLP (TF-IDF) + Rule-Based AI | No LLMs | Streamlit Cloud Ready")
+st.title("📝 AI Resume & Portfolio Builder")
+st.caption("Generate tailored, ATS-aware resumes, cover letters, and portfolio ZIPs")
 
 st.info(
-    "This application enhances resumes using **classical NLP techniques**. "
-    "No Large Language Models, no paid APIs, and fully explainable AI."
+    "This application enhances resumes using **classical NLP techniques** and ATS keyword optimization. "
+    "Supports multiple templates and export formats (PDF, DOCX, or both)."
 )
 
-option = st.radio(
-    "Choose how you want to build your resume:",
-    ["Upload Existing Resume (PDF)", "Create New Resume (Manual Input)"]
-)
+# Sidebar options
+with st.sidebar:
+    st.header("⚙️ Options")
+    template_choice = st.selectbox("Choose Template", ["modern", "classic", "professional"])
+    export_options = ["PDF"] + (["DOCX", "BOTH"] if HAS_DOCX else [])
+    export_format = st.selectbox("Export Format", export_options)
+    
+    st.header("💾 Profile Management")
+    load_profile = st.file_uploader("Load Profile JSON", type=["json"])
 
-# ------------------------------------------------------
-# Option 1: Upload Existing Resume
-# ------------------------------------------------------
-if option == "Upload Existing Resume (PDF)":
-    uploaded_file = st.file_uploader("Upload your resume (PDF only)", type=["pdf"])
-    name = st.text_input("Your Name")
-    email = st.text_input("Email Address")
+# Main content area
+tab1, tab2, tab3 = st.tabs(["📄 Upload Resume", "✍️ Create New", "📋 Load Profile"])
 
-    if st.button("Enhance Resume"):
+profile_data = {}
+
+# Tab 1: Upload Existing Resume
+with tab1:
+    st.subheader("Upload Existing Resume (PDF)")
+    uploaded_file = st.file_uploader("Upload your resume (PDF only)", type=["pdf"], key="upload_pdf")
+    name = st.text_input("Your Name", key="name1")
+    email = st.text_input("Email Address", key="email1")
+    job_description = st.text_area("Job Description (Optional - for ATS optimization)", height=100, key="jd1")
+    
+    if st.button("Enhance Resume", key="enhance1"):
         if not uploaded_file:
             st.error("Please upload a PDF resume.")
         else:
-            resume_text = extract_text_from_pdf(uploaded_file)
-            enhanced_summary = enhance_resume(resume_text)
-            pdf_path = create_enhanced_pdf(name, email, enhanced_summary, resume_text)
+            with st.spinner("Processing resume..."):
+                resume_text = extract_text_from_pdf(uploaded_file)
+                
+                # ATS keyword extraction
+                ats_keywords = extract_keywords(job_description) if job_description else []
+                if ats_keywords:
+                    resume_text = merge_keywords(resume_text, ats_keywords)
+                
+                # Generate enhanced summary
+                enhanced_summary = enhance_resume(resume_text, job_description)
+                
+                # Generate STAR bullets
+                star_bullets = generate_star_bullets(resume_text, ats_keywords)
+                
+                # Generate cover letter
+                cover_letter = generate_cover_letter(name, job_description, resume_text)
+                
+                # Store in session state
+                profile_data = {
+                    "name": name,
+                    "email": email,
+                    "resume_text": resume_text,
+                    "summary": enhanced_summary,
+                    "cover_letter": cover_letter,
+                    "star_bullets": star_bullets,
+                    "job_description": job_description
+                }
+                st.session_state['profile_data'] = profile_data
+                
+                st.success("Resume processed successfully!")
+                
+                # Display results
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    st.subheader("AI-Enhanced Professional Summary")
+                    st.write(enhanced_summary)
+                    
+                    if star_bullets:
+                        st.subheader("STAR-Format Achievements")
+                        for bullet in star_bullets:
+                            st.write(bullet)
+                
+                with col2:
+                    st.subheader("Generated Cover Letter")
+                    st.text_area("", cover_letter, height=300, key="cl_display1")
+                
+                # Generate files
+                pdf_path = None
+                docx_path = None
+                
+                if export_format in ["PDF", "BOTH"]:
+                    pdf_path = create_pdf_resume(name, email, enhanced_summary, resume_text, template_choice, star_bullets)
+                
+                if export_format in ["DOCX", "BOTH"] and HAS_DOCX:
+                    docx_path = create_docx_resume(name, email, enhanced_summary, resume_text, template_choice, star_bullets)
+                
+                # Create portfolio ZIP
+                portfolio_zip = create_portfolio_zip(name, email, enhanced_summary, resume_text, cover_letter, pdf_path, docx_path)
+                
+                # Save profile JSON
+                profile_json = save_profile_to_json(name, email, resume_text, job_description, enhanced_summary, cover_letter)
+                
+                # Download buttons
+                st.subheader("📥 Downloads")
+                col1, col2, col3, col4 = st.columns(4)
+                
+                if pdf_path:
+                    with open(pdf_path, "rb") as f:
+                        col1.download_button("⬇️ Download PDF", data=f, file_name=pdf_path, mime="application/pdf")
+                
+                if docx_path:
+                    with open(docx_path, "rb") as f:
+                        col2.download_button("⬇️ Download DOCX", data=f, file_name=docx_path, mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+                
+                with open(portfolio_zip, "rb") as f:
+                    col3.download_button("⬇️ Download Portfolio ZIP", data=f, file_name=portfolio_zip, mime="application/zip")
+                
+                with open(profile_json, "rb") as f:
+                    col4.download_button("⬇️ Download Profile JSON", data=f, file_name=profile_json, mime="application/json")
 
-            st.subheader("AI-Enhanced Professional Summary")
-            st.write(enhanced_summary)
-
-            with open(pdf_path, "rb") as f:
-                st.download_button(
-                    "⬇️ Download Enhanced Resume (PDF)",
-                    data=f,
-                    file_name="Enhanced_AI_Resume.pdf",
-                    mime="application/pdf"
-                )
-
-# ------------------------------------------------------
-# Option 2: Create Resume from Scratch
-# ------------------------------------------------------
-else:
-    st.subheader("Enter Your Details")
-    name = st.text_input("Full Name")
-    email = st.text_input("Email Address")
-    skills = st.text_area("Skills (comma separated)")
-    projects = st.text_area("Projects / Experience")
-
-    if st.button("Generate Resume"):
+# Tab 2: Create New Resume
+with tab2:
+    st.subheader("Create New Resume")
+    name2 = st.text_input("Full Name", key="name2")
+    email2 = st.text_input("Email Address", key="email2")
+    skills = st.text_area("Skills (comma separated)", key="skills2")
+    projects = st.text_area("Projects / Experience", height=200, key="projects2")
+    job_description2 = st.text_area("Job Description (Optional - for ATS optimization)", height=100, key="jd2")
+    
+    if st.button("Generate Resume", key="generate2"):
         combined_text = f"{skills}\n{projects}".strip()
-        enhanced_summary = enhance_resume(combined_text)
-        pdf_path = create_enhanced_pdf(name, email, enhanced_summary, combined_text)
+        
+        if not combined_text:
+            st.error("Please enter skills and/or projects.")
+        else:
+            with st.spinner("Generating resume..."):
+                # ATS keyword extraction
+                ats_keywords = extract_keywords(job_description2) if job_description2 else []
+                
+                # Generate enhanced summary
+                enhanced_summary = enhance_resume(combined_text, job_description2)
+                
+                # Generate STAR bullets
+                star_bullets = generate_star_bullets(combined_text, ats_keywords)
+                
+                # Generate cover letter
+                cover_letter = generate_cover_letter(name2, job_description2, combined_text)
+                
+                # Store in session state
+                profile_data = {
+                    "name": name2,
+                    "email": email2,
+                    "resume_text": combined_text,
+                    "summary": enhanced_summary,
+                    "cover_letter": cover_letter,
+                    "star_bullets": star_bullets,
+                    "job_description": job_description2
+                }
+                st.session_state['profile_data'] = profile_data
+                
+                st.success("Resume generated successfully!")
+                
+                # Display results
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    st.subheader("Generated Professional Summary")
+                    st.write(enhanced_summary)
+                    
+                    if star_bullets:
+                        st.subheader("STAR-Format Achievements")
+                        for bullet in star_bullets:
+                            st.write(bullet)
+                
+                with col2:
+                    st.subheader("Generated Cover Letter")
+                    st.text_area("", cover_letter, height=300, key="cl_display2")
+                
+                # Generate files
+                pdf_path = None
+                docx_path = None
+                
+                if export_format in ["PDF", "BOTH"]:
+                    pdf_path = create_pdf_resume(name2, email2, enhanced_summary, combined_text, template_choice, star_bullets)
+                
+                if export_format in ["DOCX", "BOTH"] and HAS_DOCX:
+                    docx_path = create_docx_resume(name2, email2, enhanced_summary, combined_text, template_choice, star_bullets)
+                
+                # Create portfolio ZIP
+                portfolio_zip = create_portfolio_zip(name2, email2, enhanced_summary, combined_text, cover_letter, pdf_path, docx_path)
+                
+                # Save profile JSON
+                profile_json = save_profile_to_json(name2, email2, combined_text, job_description2, enhanced_summary, cover_letter)
+                
+                # Download buttons
+                st.subheader("📥 Downloads")
+                col1, col2, col3, col4 = st.columns(4)
+                
+                if pdf_path:
+                    with open(pdf_path, "rb") as f:
+                        col1.download_button("⬇️ Download PDF", data=f, file_name=pdf_path, mime="application/pdf")
+                
+                if docx_path:
+                    with open(docx_path, "rb") as f:
+                        col2.download_button("⬇️ Download DOCX", data=f, file_name=docx_path, mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+                
+                with open(portfolio_zip, "rb") as f:
+                    col3.download_button("⬇️ Download Portfolio ZIP", data=f, file_name=portfolio_zip, mime="application/zip")
+                
+                with open(profile_json, "rb") as f:
+                    col4.download_button("⬇️ Download Profile JSON", data=f, file_name=profile_json, mime="application/json")
 
-        st.subheader("Generated Professional Summary")
-        st.write(enhanced_summary)
-
-        with open(pdf_path, "rb") as f:
-            st.download_button(
-                "⬇️ Download Resume (PDF)",
-                data=f,
-                file_name="AI_Resume.pdf",
-                mime="application/pdf"
-            )
+# Tab 3: Load Profile
+with tab3:
+    st.subheader("Load Saved Profile")
+    
+    if load_profile:
+        try:
+            profile_json_data = json.load(load_profile)
+            st.success("Profile loaded successfully!")
+            
+            # Pre-fill form
+            name3 = st.text_input("Full Name", value=profile_json_data.get("name", ""), key="name3")
+            email3 = st.text_input("Email Address", value=profile_json_data.get("email", ""), key="email3")
+            resume_text3 = st.text_area("Resume Text", value=profile_json_data.get("resume_text", ""), height=200, key="resume3")
+            job_description3 = st.text_area("Job Description", value=profile_json_data.get("job_description", ""), height=100, key="jd3")
+            
+            if st.button("Regenerate Resume", key="regenerate3"):
+                with st.spinner("Regenerating resume..."):
+                    # ATS keyword extraction
+                    ats_keywords = extract_keywords(job_description3) if job_description3 else []
+                    
+                    # Generate enhanced summary
+                    enhanced_summary = enhance_resume(resume_text3, job_description3)
+                    
+                    # Generate STAR bullets
+                    star_bullets = generate_star_bullets(resume_text3, ats_keywords)
+                    
+                    # Generate cover letter
+                    cover_letter = generate_cover_letter(name3, job_description3, resume_text3)
+                    
+                    st.success("Resume regenerated!")
+                    
+                    # Display and download options (same as above)
+                    col1, col2 = st.columns(2)
+                    
+                    with col1:
+                        st.subheader("Professional Summary")
+                        st.write(enhanced_summary)
+                        
+                        if star_bullets:
+                            st.subheader("STAR-Format Achievements")
+                            for bullet in star_bullets:
+                                st.write(bullet)
+                    
+                    with col2:
+                        st.subheader("Cover Letter")
+                        st.text_area("", cover_letter, height=300, key="cl_display3")
+                    
+                    # Generate files
+                    pdf_path = None
+                    docx_path = None
+                    
+                    if export_format in ["PDF", "BOTH"]:
+                        pdf_path = create_pdf_resume(name3, email3, enhanced_summary, resume_text3, template_choice, star_bullets)
+                    
+                    if export_format in ["DOCX", "BOTH"] and HAS_DOCX:
+                        docx_path = create_docx_resume(name3, email3, enhanced_summary, resume_text3, template_choice, star_bullets)
+                    
+                    portfolio_zip = create_portfolio_zip(name3, email3, enhanced_summary, resume_text3, cover_letter, pdf_path, docx_path)
+                    profile_json = save_profile_to_json(name3, email3, resume_text3, job_description3, enhanced_summary, cover_letter)
+                    
+                    st.subheader("📥 Downloads")
+                    col1, col2, col3, col4 = st.columns(4)
+                    
+                    if pdf_path:
+                        with open(pdf_path, "rb") as f:
+                            col1.download_button("⬇️ Download PDF", data=f, file_name=pdf_path, mime="application/pdf")
+                    
+                    if docx_path:
+                        with open(docx_path, "rb") as f:
+                            col2.download_button("⬇️ Download DOCX", data=f, file_name=docx_path, mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+                    
+                    with open(portfolio_zip, "rb") as f:
+                        col3.download_button("⬇️ Download Portfolio ZIP", data=f, file_name=portfolio_zip, mime="application/zip")
+                    
+                    with open(profile_json, "rb") as f:
+                        col4.download_button("⬇️ Download Profile JSON", data=f, file_name=profile_json, mime="application/json")
+        
+        except json.JSONDecodeError:
+            st.error("Invalid JSON file. Please check the file format.")
+    else:
+        st.info("Upload a JSON profile file to load your saved profile data.")
